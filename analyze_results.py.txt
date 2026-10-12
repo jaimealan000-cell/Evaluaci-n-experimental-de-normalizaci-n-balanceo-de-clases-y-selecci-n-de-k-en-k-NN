@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Analiza estadísticamente las cuatro configuraciones de k-NN.
+
+Usa los promedios por dataset generados por run_knn_experiments.py y produce:
+- rankings promedio;
+- prueba de Friedman;
+- Wilcoxon pareado con corrección de Holm;
+- conteos de victorias, empates y derrotas;
+- frecuencia de la configuración ganadora.
+"""
+
+from __future__ import annotations
+
+import argparse
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import friedmanchisquare, rankdata, wilcoxon
+
+
+def holm_adjust(p_values: list[float]) -> list[float]:
+    m = len(p_values)
+    order = np.argsort(p_values)
+    adjusted = np.empty(m, dtype=float)
+    running_max = 0.0
+    for position, index in enumerate(order):
+        value = min(1.0, (m - position) * p_values[index])
+        running_max = max(running_max, value)
+        adjusted[index] = running_max
+    return adjusted.tolist()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Análisis estadístico de resultados.")
+    parser.add_argument("results_dir", type=Path)
+    parser.add_argument(
+        "--metric",
+        default="macro_f1_mean",
+        help="Columna de dataset_results.csv que se comparará.",
+    )
+    parser.add_argument(
+        "--tie-tolerance",
+        type=float,
+        default=1e-12,
+        help="Tolerancia numérica para declarar empates.",
+    )
+    args = parser.parse_args()
+
+    input_path = args.results_dir / "dataset_results.csv"
+    if not input_path.exists():
+        raise SystemExit(f"No existe: {input_path}")
+
+    df = pd.read_csv(input_path)
+    if args.metric not in df.columns:
+        raise SystemExit(f"La métrica {args.metric!r} no aparece en {input_path.name}")
+
+    pivot = df.pivot(index="dataset", columns="configuration", values=args.metric)
+    complete = pivot.dropna(axis=0, how="any")
+    if complete.shape[1] < 2:
+        raise SystemExit("No hay suficientes configuraciones para comparar.")
+
+    ranks = complete.apply(
+        lambda row: pd.Series(
+            rankdata(-row.to_numpy(dtype=float), method="average"), index=row.index
+        ),
+        axis=1,
+    )
+    average_ranks = (
+        ranks.mean(axis=0)
+        .sort_values()
+        .rename("average_rank")
+        .reset_index()
+    )
+    average_ranks.to_csv(args.results_dir / f"average_ranks_{args.metric}.csv", index=False)
+
+    friedman_row = {
+        "metric": args.metric,
+        "n_datasets_complete": int(complete.shape[0]),
+        "n_configurations": int(complete.shape[1]),
+        "statistic": np.nan,
+        "p_value": np.nan,
+    }
+    if complete.shape[0] >= 2 and complete.shape[1] >= 3:
+        statistic, p_value = friedmanchisquare(
+            *[complete[col].to_numpy() for col in complete.columns]
+        )
+        friedman_row["statistic"] = float(statistic)
+        friedman_row["p_value"] = float(p_value)
+    pd.DataFrame([friedman_row]).to_csv(
+        args.results_dir / f"friedman_{args.metric}.csv", index=False
+    )
+
+    pairs = list(combinations(complete.columns, 2))
+    pair_rows: list[dict] = []
+    raw_p: list[float] = []
+
+    for a, b in pairs:
+        x = complete[a].to_numpy(dtype=float)
+        y = complete[b].to_numpy(dtype=float)
+        differences = x - y
+        wins = int(np.sum(differences > args.tie_tolerance))
+        losses = int(np.sum(differences < -args.tie_tolerance))
+        ties = int(len(differences) - wins - losses)
+
+        if np.all(np.abs(differences) <= args.tie_tolerance):
+            statistic, p_value = 0.0, 1.0
+        else:
+            statistic, p_value = wilcoxon(
+                x,
+                y,
+                zero_method="pratt",
+                alternative="two-sided",
+                method="auto",
+            )
+
+        raw_p.append(float(p_value))
+        pair_rows.append(
+            {
+                "configuration_a": a,
+                "configuration_b": b,
+                "n_datasets": int(len(x)),
+                "mean_a": float(np.mean(x)),
+                "mean_b": float(np.mean(y)),
+                "wins_a": wins,
+                "ties": ties,
+                "losses_a": losses,
+                "wilcoxon_statistic": float(statistic),
+                "p_value_raw": float(p_value),
+            }
+        )
+
+    adjusted = holm_adjust(raw_p)
+    for row, p_adj in zip(pair_rows, adjusted):
+        row["p_value_holm"] = p_adj
+        row["significant_0_05"] = bool(p_adj < 0.05)
+
+    pd.DataFrame(pair_rows).to_csv(
+        args.results_dir / f"pairwise_wilcoxon_holm_{args.metric}.csv", index=False
+    )
+
+    winner_counts = (
+        complete.idxmax(axis=1)
+        .value_counts()
+        .rename_axis("configuration")
+        .rename("wins")
+        .reset_index()
+    )
+    winner_counts.to_csv(
+        args.results_dir / f"winner_counts_{args.metric}.csv", index=False
+    )
+
+    print(f"Datasets completos analizados: {complete.shape[0]}")
+    print("Rankings promedio:")
+    print(average_ranks.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
